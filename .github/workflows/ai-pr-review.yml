@@ -1,0 +1,137 @@
+name: AI PR Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require AI_API_KEY and AI_MODEL
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+        run: |
+          missing=0
+          if [ -z "$AI_API_KEY" ]; then
+            echo "::error::Missing repository secret AI_API_KEY"
+            missing=1
+          fi
+          if [ -z "$AI_MODEL" ]; then
+            echo "::error::Missing repository variable AI_MODEL"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Fetch PR diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -H "Accept: application/vnd.github.diff" \
+            "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" \
+            > /tmp/pr.diff
+          if [ ! -s /tmp/pr.diff ]; then
+            echo "No diff to review."
+            echo "SKIP_REVIEW=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Review diff with the model
+        if: env.SKIP_REVIEW != '1'
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 << 'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          diff_path = "/tmp/pr.diff"
+          out_path = "/tmp/review.md"
+          max_chars = 80_000
+
+          with open(diff_path, encoding="utf-8", errors="replace") as f:
+              diff = f.read()
+
+          if not diff.strip():
+              sys.exit(0)
+
+          if len(diff) > max_chars:
+              diff = diff[:max_chars] + "\n\n[diff truncated]\n"
+
+          payload = {
+              "model": os.environ["AI_MODEL"],
+              "temperature": 0,
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a senior code reviewer. Review this pull request diff. "
+                          "Only report real bugs, security issues, or risky changes. "
+                          "Do not nitpick style, naming, or missing tests unless they cause a real bug. "
+                          "If there is nothing material to flag, reply with exactly: NO_ISSUES. "
+                          "Otherwise write a short review: a few bullets, under 200 words."
+                      ),
+                  },
+                  {
+                      "role": "user",
+                      "content": f"PR #{os.environ.get('PR_NUMBER', '')} diff:\n\n{diff}",
+                  },
+              ],
+          }
+
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/chat/completions",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {os.environ['AI_API_KEY']}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  body = json.loads(resp.read().decode("utf-8"))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")
+              print(f"::error::Model request failed with HTTP {exc.code}", file=sys.stderr)
+              print(detail[:2000], file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              text = body["choices"][0]["message"]["content"].strip()
+          except (KeyError, IndexError, AttributeError, TypeError):
+              print("::error::Unexpected model response shape", file=sys.stderr)
+              sys.exit(1)
+
+          if not text or text == "NO_ISSUES" or text.upper().startswith("NO_ISSUES"):
+              print("Nothing material to flag.")
+              sys.exit(0)
+
+          with open(out_path, "w", encoding="utf-8") as f:
+              f.write(text)
+              f.write("\n")
+          PY
+
+      - name: Post review comment
+        if: env.SKIP_REVIEW != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -s /tmp/review.md ]; then
+            echo "Skipping comment: no real bugs or risky changes."
+            exit 0
+          fi
+          gh pr review "${{ github.event.pull_request.number }}" --comment --body-file /tmp/review.md
